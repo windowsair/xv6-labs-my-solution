@@ -14,4 +14,4 @@ All the hints are available on the lab website.
 
 If you don't understand the page table at all, there may be some trouble in implementing statistics on free memory. Reading section 3.5 in Chapter 3 of the xv6 book can help you understand what's going on.
 
-> In fact, the page tables are stored as list(struct run), each with a fixed size.
+> In fact, the page tables are stored as ***free list***(struct run), each with a fixed size.
