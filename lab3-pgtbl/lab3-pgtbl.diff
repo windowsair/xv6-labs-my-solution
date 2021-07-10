@@ -1,0 +1,310 @@
+diff --git a/grade-lab-pgtbl b/grade-lab-pgtbl
+old mode 100755
+new mode 100644
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a73b4f7..facfc87 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -178,6 +178,17 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t, int);
++void            kernel_update_satp(pagetable_t);
++void            kernel_share_vm_map(pagetable_t ,uint64 , uint64 , uint64 , int);
++pagetable_t     kernel_share_vm_init(void);
++void            kernel_share_vm_free(pagetable_t);
++void            kernel_user_pagemap(pagetable_t kpage, pagetable_t upage, uint64 oldsz, uint64 newsz);
++
++int 			copyin_new(pagetable_t, char*, uint64, uint64);
++int 			copyinstr_new(pagetable_t, char*, uint64, uint64);
++
++
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 0e8762f..eec7043 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -116,6 +116,10 @@ exec(char *path, char **argv)
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+ 
++  if (p->pid == 1) // print first pagetable.
++    vmprint(p->pagetable, 0);
++  kernel_user_pagemap(p->kernel_pagetable, p->pagetable, 0, p->sz);
++
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..445cdbc 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -121,6 +121,14 @@ found:
+     return 0;
+   }
+ 
++  // Create new share kernel page table.
++  p->kernel_pagetable = kernel_share_vm_init();
++  if (p->kernel_pagetable == 0) {
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -141,6 +149,11 @@ freeproc(struct proc *p)
+   p->trapframe = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
++  if (p->kernel_pagetable) {
++    // no need to call `kernel_user_pagemap`
++    kernel_share_vm_free((void*)p->kernel_pagetable);
++  } 
++  p->kernel_pagetable = 0;
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -230,6 +243,7 @@ userinit(void)
+ 
+   p->state = RUNNABLE;
+ 
++  kernel_user_pagemap(p->kernel_pagetable, p->pagetable, 0, p->sz);
+   release(&p->lock);
+ }
+ 
+@@ -249,6 +263,7 @@ growproc(int n)
+   } else if(n < 0){
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
++  kernel_user_pagemap(p->kernel_pagetable, p->pagetable, sz - n, sz);
+   p->sz = sz;
+   return 0;
+ }
+@@ -295,6 +310,7 @@ fork(void)
+ 
+   np->state = RUNNABLE;
+ 
++  kernel_user_pagemap(np->kernel_pagetable, np->pagetable, 0, np->sz);
+   release(&np->lock);
+ 
+   return pid;
+@@ -446,6 +462,7 @@ wait(uint64 addr)
+   }
+ }
+ 
++extern pagetable_t kernel_pagetable;
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+@@ -473,13 +490,14 @@ scheduler(void)
+         // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
++        kernel_update_satp(p->kernel_pagetable);
+         swtch(&c->context, &p->context);
+ 
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
+-
+         found = 1;
++        kernel_update_satp(kernel_pagetable);
+       }
+       release(&p->lock);
+     }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..08a7c5d 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -98,6 +98,7 @@ struct proc {
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
++  pagetable_t kernel_pagetable;// Kernel page table
+   struct trapframe *trapframe; // data page for trampoline.S
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..8e83484 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -379,6 +379,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ int
+ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ {
++  return copyin_new(pagetable, dst, srcva, len);
+   uint64 n, va0, pa0;
+ 
+   while(len > 0){
+@@ -405,6 +406,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ int
+ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ {
++  return copyinstr_new(pagetable, dst, srcva, max);
+   uint64 n, va0, pa0;
+   int got_null = 0;
+ 
+@@ -440,3 +442,154 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++static void print_dot(int num) {
++  switch (num)
++  {
++  case 1:
++    printf("..");
++    break;
++  case 2:
++    printf(".. ..");
++    break;
++  case 3:
++    printf(".. .. ..");
++    break;
++  default:
++    break;
++  }
++}
++
++
++void 
++vmprint(pagetable_t pagetable, int depth) {
++  // first line
++  if (depth == 0) {
++    printf("page table %p\n", pagetable);
++    depth = 1;
++  }
++  
++  // there are 2^9 = 512 PTEs in a page table.
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++    if ((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0) {
++      // this PTE points to a lower-level page table.
++      uint64 child = PTE2PA(pte);
++      print_dot(depth);
++      printf("%d: pte %p pa %p\n", i, pte, child);
++      vmprint((pagetable_t)child, depth + 1);
++    } else if ((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) != 0) {
++      // leaf mapping.
++      // just print.
++      uint64 pa = PTE2PA(pte);
++      print_dot(depth);
++      printf("%d: pte %p pa %p\n", i, pte, pa);
++    }
++  }
++}
++
++void
++kernel_update_satp(pagetable_t pagetable)
++{
++  w_satp(MAKE_SATP(pagetable));
++  sfence_vma();
++}
++
++void
++kernel_share_vm_map(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
++{
++  if(mappages(pagetable, va, sz, pa, perm) != 0)
++    panic("kernel_share_vm_map");
++}
++
++pagetable_t
++kernel_share_vm_init(void)
++{
++  pagetable_t pagetable = (pagetable_t) kalloc();
++  if (pagetable == 0) 
++    return 0;
++  memset(pagetable, 0, PGSIZE);
++  // Note that pagetable is a PTE array.
++
++  // For user vm space, we use 0x0 ~ (CLINT)0x02000000
++  // Furthermore, if we don't use the direct mapping method for IO device, 
++  // then we can at least use the address of 0x80000000 (KERNELBASE)
++
++  // Note that `pagetable` is a L2 PTE.
++  // 000 000 000       000 010 000     000 000 000     0000 0000 0000   -> 0x02000000(CLINT)
++  // |   L2    |       |    L1   |     |  L0     |     | 12bit offset |
++
++  // We find that L2 of user space is 0.
++
++  // So here starts from 1, and 0 is reserved for user space to store data.
++  for (int i = 1; i < 512; i++) {
++    pagetable[i] = kernel_pagetable[i];
++  }
++
++  // These addresses can not be access by user.
++
++  // uart registers
++  kernel_share_vm_map(pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
++
++  // virtio mmio disk interface
++  kernel_share_vm_map(pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
++
++  // CLINT
++  kernel_share_vm_map(pagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
++
++  // PLIC
++  kernel_share_vm_map(pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
++
++  return pagetable;
++}
++
++
++void
++kernel_share_vm_free(pagetable_t pagetable) {
++  // L2 -> L1 -> L0 -> address
++  // We have discussed in `kernel_share_vm_init`, L2 index is 0.
++
++  // get L1 pagetable base address
++  pte_t L2 = pagetable[0];
++  pagetable_t L1_pagetable = (pagetable_t)PTE2PA(L2);
++
++  // vmprint(L1_pagetable, 2); 
++  // It can be seen intuitively that the user program is divided into several segments  
++  
++  for (int index = 0; index < 512; index++) {
++    pte_t L1 = L1_pagetable[index];
++    if (L1 & PTE_V) {
++      pagetable_t L0_pagetable = (pagetable_t)PTE2PA(L1);
++      kfree((void *)L0_pagetable);
++      L1_pagetable[index] = 0;
++    }
++    // No need to release leaf physical memory pages
++  }
++
++  kfree((void *) L1_pagetable);
++  kfree((void *) pagetable);
++}
++
++void
++kernel_user_pagemap(pagetable_t kpage, pagetable_t upage, uint64 oldsz, uint64 newsz) {
++  uint64 va;
++  pte_t *kpte;
++  pte_t *upte;
++
++  if (newsz > oldsz) {
++    for (va = oldsz; va < newsz; va += PGSIZE) {
++      kpte = walk(kpage, va, 1); // alloc
++      upte = walk(upage, va, 0);
++      *kpte = *upte;
++      *kpte &= ~(PTE_U); // clear user bit. (A page with PTE_U set cannot be accessed in kernel)
++    }
++  } 
++  else if (oldsz > newsz) {
++    // for sbrk(-n), n > 0
++    for (va = newsz; va < oldsz; va += PGSIZE) {
++      kpte = walk(kpage, va, 0);
++      *kpte &= ~(PTE_V); // clear valid bit.
++    }
++  }
++
++}
+\ No newline at end of file
+diff --git a/user/usys.pl b/user/usys.pl
+old mode 100755
+new mode 100644
