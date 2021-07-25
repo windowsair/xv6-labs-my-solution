@@ -1,6 +1,6 @@
 # Foreword
 
-This experiment is mainly used to familiar with the virtual memory mechanism. I would like to give the specification first, and then detail the behavior of each step.
+This lab is mainly used to familiar with the virtual memory mechanism. I would like to give the specification first, and then detail the behavior of each step.
 
 The translation process is as follows:
 
@@ -9,9 +9,11 @@ The translation process is as follows:
 `va` is the virtual address input and `pa` is the physical address output. The PAGESIZE constant is 2^12. For Sv32, LEVELS=2 and PTESIZE=4, whereas for Sv39, LEVELS=3 and PTESIZE=8.
 
 First of all, `level` represents the number of levels of the page table, which is relatively intuitive. But what does `PTESIZE` mean? It is actually the size of the PTE itself. As shown in the figure below, the PTE structure of sv32 contains 32 bits, corresponding to 4 bytes, while the PTE structure of sv39 corresponds to 64 bits, corresponding to 8 bytes.
+
 ![PTE](assets/pte.png)
 
 The second question is, what is `PPN` (physical page number) and `VPN`(visual page number) ? Here I would like to start with the translation process. For sv39, the virtual address will probably look like this:
+
 ![sv39_va](assets/sv39_virtual_address.png)
 
 You can see that there are three VPNs, and each VPN actually corresponds to an ***offset*** inside the page table.
@@ -49,6 +51,7 @@ The above process is exactly what `PX(level, va)` does in xv6.
 
 
 Now, we get a L2 PTE. Assuming that this PTE is valid and points to the next level page table (no a leaf node), then we can get the next level PTE:
+
 ![sv39_pte](assets/sv39_PTE.png)
 
 `let a = pte.ppn X PAGESIZE`, that is equivalent to moving the PPN to the corresponding position of the physical address and setting the offset bit field to 0.
@@ -103,7 +106,9 @@ Which method you actually use is a matter of opinion.
 These two parts actually solve the same problem: enable the kernel to access user space and kernel space at the same time without switching page tables, while users can only access their own user space.
 
 We noticed that the user space starts at address 0x0:
+
 ![mapping](assets/address_map.png)
+
 If we do not change the mapping in other places, then we can use the CLINT space at most.
 
 Furthermore, if we don't use the direct mapping method for IO device, then we can at least use the address of 0x80000000 (KERNELBASE).
@@ -140,6 +145,7 @@ So, we just need to see when the memory size of the process has changed and map 
 The problem that we can intuitively sense is that, there is too little memory available in user space.
 
 We found that IO devices with low addresses take up a lot of space, so one solution is to map them to high address space instead of using direct-map.
+
 ![](assets/io_map.png)
 
 ### super-page

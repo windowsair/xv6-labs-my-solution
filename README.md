@@ -4,7 +4,7 @@ Just some of my implementation. For the original version, please visit the xv6 r
 
 # Introduce
 
-This repo contains my solution of each lab. I use more detailed comments and include some insights from each lab which can be found in `README.md`. Hope you will find it helpful😘.
+This repo contains my solution of each lab. I use more detailed comments and include some insights from each lab which can be found in `README.md`. Also, I give the modified files and the corresponding `xxx.diff` files, which can be found in the directory of each lab. Hope you will find it helpful😘.
 
 # One More Thing...
 

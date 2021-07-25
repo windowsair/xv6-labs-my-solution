@@ -1,0 +1,68 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+old mode 100644
+new mode 100755
+index 4b9bbc0..137c786
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..5b7d746 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -132,3 +132,16 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++void
++backtrace(void)
++{
++  uint64 *fp = (uint64 *)r_fp();
++  uint64 *ra;
++  while ((uint64)fp < PGROUNDUP((uint64)fp)) {
++    ra = fp - 1; // point to return address
++    fp = fp - 2; // point prev fp
++    fp = (uint64 *)*fp; // get prev fp
++    printf("%p\n", *ra); // get return address
++  }
++}
+\ No newline at end of file
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..6319c88 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -319,6 +319,15 @@ sfence_vma()
+   asm volatile("sfence.vma zero, zero");
+ }
+ 
++// read frame pointer
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
+ 
+ #define PGSIZE 4096 // bytes per page
+ #define PGSHIFT 12  // bits of offset within a page
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..fd19d2a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -70,6 +70,7 @@ sys_sleep(void)
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
++  backtrace();
+   return 0;
+ }
+ 

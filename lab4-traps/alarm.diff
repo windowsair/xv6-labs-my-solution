@@ -1,0 +1,242 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..e0d5de0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -35,7 +35,8 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o\
++  $K/alarm.o
+ 
+ ifeq ($(LAB),pgtbl)
+ OBJS += \
+@@ -175,6 +176,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_alarmtest
+ 
+ 
+ 
+diff --git a/kernel/alarm.c b/kernel/alarm.c
+new file mode 100644
+index 0000000..3b9aa85
+--- /dev/null
++++ b/kernel/alarm.c
+@@ -0,0 +1,41 @@
++#include "types.h"
++#include "param.h"
++#include "spinlock.h"
++#include "riscv.h"
++#include "defs.h"
++#include "proc.h"
++
++
++uint64
++sys_sigalarm(void)
++{
++  int tick;
++  uint64 handle_address;
++  struct proc *p = myproc();
++
++  if(argint(0, &tick) < 0 || argaddr(1, &handle_address) < 0)
++    return -1;
++
++  p->alarm_tick = tick;
++  p->alarm_handle = (void (*)(void))handle_address;
++  if (tick == 0 && handle_address == 0) {
++    p->alarm_set = 0;
++  }
++  else {
++    p->alarm_set = 1;
++  }
++
++  return 0;
++}
++
++uint64
++sys_sigreturn(void)
++{
++  struct proc *p = myproc();
++  if (p->alarm_running) {
++    p->alarm_running = 0;
++    // Recover user register
++    memmove(p->trapframe, &p->pre_trapframe, sizeof(struct trapframe));
++  }
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+old mode 100644
+new mode 100755
+index 4b9bbc0..137c786
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..5b7d746 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -132,3 +132,16 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++void
++backtrace(void)
++{
++  uint64 *fp = (uint64 *)r_fp();
++  uint64 *ra;
++  while ((uint64)fp < PGROUNDUP((uint64)fp)) {
++    ra = fp - 1; // point to return address
++    fp = fp - 2; // point prev fp
++    fp = (uint64 *)*fp; // get prev fp
++    printf("%p\n", *ra); // get return address
++  }
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..cd49a74 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,4 +103,11 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  int alarm_tick;              // tick set
++  int alarm_count;             // hardware timer count
++  int alarm_set;               // is set?
++  int alarm_running;           // is running?
++  void (*alarm_handle)(void);
++  struct trapframe pre_trapframe;
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..6319c88 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -319,6 +319,15 @@ sfence_vma()
+   asm volatile("sfence.vma zero, zero");
+ }
+ 
++// read frame pointer
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
+ 
+ #define PGSIZE 4096 // bytes per page
+ #define PGSHIFT 12  // bits of offset within a page
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..24bfccd 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm] sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..68b3161 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm     22
++#define SYS_sigreturn    23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..fd19d2a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -70,6 +70,7 @@ sys_sleep(void)
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
++  backtrace();
+   return 0;
+ }
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..a7b44d7 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,8 +77,24 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
+-    yield();
++  if(which_dev == 2) {
++    if (p->alarm_set == 1)
++      p->alarm_count++;
++
++    if (p->alarm_set == 1 && p->alarm_count == p->alarm_tick) {
++      p->alarm_count = 0;
++      if (p->alarm_running == 0) { // prevent re-entrant call
++        p->alarm_running = 1;
++        // step1. save all user register
++        memmove(&p->pre_trapframe, p->trapframe, sizeof(struct trapframe));
++        // step2. change PC to handle
++        p->trapframe->epc = (uint64)p->alarm_handle;
++        // We will go to usertrapret.
++      }
++    } else {
++      yield();
++    }
++  }
+ 
+   usertrapret();
+ }
+diff --git a/user/user.h b/user/user.h
+index b71ecda..bbc0ffa 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sigalarm(int ticks, void (*handler)()); 
++int sigreturn(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..3c258dc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
+\ No newline at end of file
