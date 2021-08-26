@@ -1,0 +1,221 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..d94fdfe 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -164,6 +164,7 @@ void            uvminit(pagetable_t, uchar *, uint);
+ uint64          uvmalloc(pagetable_t, uint64, uint64);
+ uint64          uvmdealloc(pagetable_t, uint64, uint64);
+ int             uvmcopy(pagetable_t, pagetable_t, uint64);
++int             cowcopy(pagetable_t, uint64);
+ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..5c31b13 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -14,6 +14,8 @@ void freerange(void *pa_start, void *pa_end);
+ extern char end[]; // first address after kernel.
+                    // defined by kernel.ld.
+ 
++int mem_ref_cnt[PHYSTOP / PGSIZE] = { 0 };
++
+ struct run {
+   struct run *next;
+ };
+@@ -51,6 +53,16 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  acquire(&kmem.lock);
++  if (mem_ref_cnt[(uint64)pa / PGSIZE] > 0) {
++    mem_ref_cnt[(uint64)pa / PGSIZE]--;
++  }
++  if (mem_ref_cnt[(uint64)pa / PGSIZE] > 0) { // still > 0
++    release(&kmem.lock);
++    return;
++  }
++  release(&kmem.lock);
++
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -72,8 +84,11 @@ kalloc(void)
+ 
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r) {
+     kmem.freelist = r->next;
++    mem_ref_cnt[(uint64)r / PGSIZE] = 1;
++  }
++
+   release(&kmem.lock);
+ 
+   if(r)
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..2ea8ecb 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -331,6 +331,7 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_COW (1L << 8) // is cow page?
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..d93c1a1 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,6 +67,10 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
++  } else if (r_scause() == 15) {
++    if (cowcopy(p->pagetable, r_stval()) < 0) {
++      p->killed = 1;
++    }
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..66ad956 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -2,9 +2,11 @@
+ #include "types.h"
+ #include "memlayout.h"
+ #include "elf.h"
++#include "spinlock.h"
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -15,6 +17,17 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++struct run {
++  struct run *next;
++};
++
++extern struct {
++  struct spinlock lock;
++  struct run *freelist;
++}  kmem;
++
++extern int mem_ref_cnt[];
++
+ /*
+  * create a direct-map page table for the kernel.
+  */
+@@ -311,8 +324,10 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
++  //char *mem;
+ 
++  // i: virtual address
++  // pa: old physical address
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+@@ -320,11 +335,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++
++    *pte &= ~(PTE_W); // clear parent process PTE_W
++    *pte |= PTE_COW;  // set parent process PTE_COW
++
++    acquire(&kmem.lock);
++    mem_ref_cnt[pa / PGSIZE]++;
++    release(&kmem.lock);
++    // if((mem = kalloc()) == 0)
++    //   goto err;
++    // memmove(mem, (char*)pa, PGSIZE);
++
++    // use parent process physical address
++    // clear PTE_W and set PTE_COW
++    if(mappages(new, i, PGSIZE, (uint64)pa, (flags & (~PTE_W)) | PTE_COW) != 0){
++      //kfree(mem);
+       goto err;
+     }
+   }
+@@ -335,6 +360,40 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   return -1;
+ }
+ 
++int 
++cowcopy(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte;
++  uint64 pa;
++  char *mem;
++  uint flags;
++
++  // step1: find pte
++  if (va > MAXVA)
++    return -1; // avoid panic
++  pte = walk(pagetable, va, 0);
++  if (pte == 0)
++    return -1;
++  pa = PTE2PA(*pte);
++  flags = PTE_FLAGS(*pte);
++
++  // step2: create a new mem block
++  mem = kalloc();
++  if (mem == 0)
++    return -1;
++
++  // step3: copy old data to new mem block
++  memmove(mem, (char *)pa, PGSIZE);
++
++  // step4: free the old page table
++  kfree((char *)pa);
++
++  // step5: create a new mapping
++  *pte = PA2PTE(mem) | flags | PTE_W; // set PTE_W
++  *pte &= ~PTE_COW; // clear PTE_COW
++  return 0;
++}
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+@@ -354,10 +413,24 @@ uvmclear(pagetable_t pagetable, uint64 va)
+ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
++  pte_t *pte;
+   uint64 n, va0, pa0;
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
++    if (va0 > MAXVA)
++      return -1; // avoid panic
++
++    pte = walk(pagetable, va0, 0);
++    if (pte == 0)
++      return -1;
++    if (*pte & PTE_COW) {
++      if (cowcopy(pagetable, dstva) < 0) {
++        struct proc *p = myproc();
++        p->killed = 1;
++      }
++    }
++
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;

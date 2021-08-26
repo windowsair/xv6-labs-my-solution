@@ -95,7 +95,7 @@ In the lazy allocation version, we do not allocate memory immediately, and the m
 
 fork's copy operations for memory are done by `uvmcopy`. The validity of the PTE may be checked during this process and is invalid for unassigned addresses. We can take some simple actions to ignore the check for unallocated space.
 
-# Memory Free
+## Memory Free
 
 The memory release process is somewhat similar to `fork` in that it removes the mapping of virtual addresses to physical addresses. This mapping relationship does not exist for unallocated memory, and again, you need to ignore them.
 
