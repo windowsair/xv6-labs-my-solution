@@ -1,0 +1,21 @@
+diff --git a/notxv6/barrier.c b/notxv6/barrier.c
+index 12793e8..c177311 100644
+--- a/notxv6/barrier.c
++++ b/notxv6/barrier.c
+@@ -31,6 +31,16 @@ barrier()
+   // then increment bstate.round.
+   //
+   
++  pthread_mutex_lock(&bstate.barrier_mutex);
++  if (bstate.nthread + 1 != nthread) {
++    bstate.nthread++;
++    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex); 
++  } else {
++    bstate.round++;
++    bstate.nthread = 0;
++    pthread_cond_broadcast(&bstate.barrier_cond);
++  }
++  pthread_mutex_unlock(&bstate.barrier_mutex);
+ }
+ 
+ static void *
